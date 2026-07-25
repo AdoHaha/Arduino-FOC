@@ -9,7 +9,9 @@ MagneticSensorSPIConfig_s AS5147_SPI = {
   .angle_register = 0x3FFF,
   .data_start_bit = 13,
   .command_rw_bit = 14,
-  .command_parity_bit = 15
+  .command_parity_bit = 15,
+  .response_parity_bit = 15,
+  .response_error_bit = 14
 };
 
 // AS5048 and AS5047 share the same configuration as AS5147
@@ -22,7 +24,9 @@ MagneticSensorSPIConfig_s AS5048_SPI = {
   .angle_register = 0x3FFF,
   .data_start_bit = 13,
   .command_rw_bit = 14,
-  .command_parity_bit = 15
+  .command_parity_bit = 15,
+  .response_parity_bit = 15,
+  .response_error_bit = 14
 };
 MagneticSensorSPIConfig_s AS5047_SPI = {
   .spi_mode = SPI_MODE1,
@@ -31,7 +35,9 @@ MagneticSensorSPIConfig_s AS5047_SPI = {
   .angle_register = 0x3FFF,
   .data_start_bit = 13,
   .command_rw_bit = 14,
-  .command_parity_bit = 15
+  .command_parity_bit = 15,
+  .response_parity_bit = 15,
+  .response_error_bit = 14
 };
 
 /** Typical configuration for the 14bit MonolithicPower MA730 magnetic sensor over SPI interface */
@@ -42,7 +48,9 @@ MagneticSensorSPIConfig_s MA730_SPI = {
   .angle_register = 0x0000,
   .data_start_bit = 15,
   .command_rw_bit = 0,  // not required
-  .command_parity_bit = 0 // parity not implemented
+  .command_parity_bit = 0, // parity not implemented
+  .response_parity_bit = 0,
+  .response_error_bit = 0
 };
 
 
@@ -64,6 +72,10 @@ MagneticSensorSPI::MagneticSensorSPI(int cs, int _bit_resolution, int _angle_reg
   command_parity_bit = 15; // for backwards compatibilty
   command_rw_bit = 14; // for backwards compatibilty
   data_start_bit = 13; // for backwards compatibilty
+  // Preserve the legacy generic constructor's behavior. Response validation
+  // is enabled only by configurations which explicitly describe its bits.
+  response_parity_bit = 0;
+  response_error_bit = 0;
 }
 
 MagneticSensorSPI::MagneticSensorSPI(MagneticSensorSPIConfig_s config, int cs, long _clock_speed){
@@ -81,6 +93,8 @@ MagneticSensorSPI::MagneticSensorSPI(MagneticSensorSPIConfig_s config, int cs, l
   command_parity_bit = config.command_parity_bit; // for backwards compatibilty
   command_rw_bit = config.command_rw_bit; // for backwards compatibilty
   data_start_bit = config.data_start_bit; // for backwards compatibilty
+  response_parity_bit = config.response_parity_bit;
+  response_error_bit = config.response_error_bit;
 }
 
 void MagneticSensorSPI::init(SPIClass* _spi){
@@ -101,12 +115,27 @@ void MagneticSensorSPI::init(SPIClass* _spi){
 //  Shaft angle calculation
 //  angle is in radians [rad]
 float MagneticSensorSPI::getSensorAngle(){
-  return (getRawCount() / (float)cpr) * _2PI;
+  int raw_count = getRawCount();
+  if (raw_count < 0) {
+    return -1.0f;
+  }
+  return (raw_count / (float)cpr) * _2PI;
 }
 
 // function reading the raw counter of the magnetic sensor
 int MagneticSensorSPI::getRawCount(){
 	return (int)MagneticSensorSPI::read(angle_register);
+}
+
+bool MagneticSensorSPI::hasValidData() const {
+  return last_valid_count >= 0;
+}
+
+void MagneticSensorSPI::clearErrorCounters() {
+  parity_error_count = 0;
+  sensor_error_count = 0;
+  successful_retry_count = 0;
+  exhausted_retry_count = 0;
 }
 
 // SPI functions 
@@ -130,7 +159,7 @@ byte MagneticSensorSPI::spiCalcEvenParity(word value){
   * Takes the address of the register as a 16 bit word
   * Returns the value of the register
   */
-word MagneticSensorSPI::read(word angle_register){
+int MagneticSensorSPI::read(word angle_register){
 
   word command = angle_register;
 
@@ -142,33 +171,73 @@ word MagneticSensorSPI::read(word angle_register){
   	command |= ((word)spiCalcEvenParity(command) << command_parity_bit);
   }
 
-  //SPI - begin transaction
+  const bool validate_response =
+      response_parity_bit > 0 || response_error_bit > 0;
+  const uint16_t attempts =
+      validate_response ? (uint16_t)response_retries + 1u : 1u;
+  const word data_mask = 0xFFFF >> (16 - bit_resolution);
+
+  MagneticSensorSPIReadStatus failed_status = MAGNETIC_SENSOR_SPI_READ_OK;
+  for (uint16_t attempt = 0; attempt < attempts; attempt++) {
+    last_response = transferResponse(command);
+
+    const MagneticSensorSPIReadStatus status =
+        magneticSensorSPIValidateResponse(
+            last_response, response_parity_bit, response_error_bit);
+    if (status == MAGNETIC_SENSOR_SPI_READ_OK) {
+      word register_value =
+          last_response >> (1 + data_start_bit - bit_resolution);
+      last_valid_count = register_value & data_mask;
+      last_read_status = MAGNETIC_SENSOR_SPI_READ_OK;
+      if (attempt > 0) {
+        successful_retry_count++;
+      }
+      return last_valid_count;
+    }
+
+    failed_status = (MagneticSensorSPIReadStatus)(
+        (uint8_t)failed_status | (uint8_t)status);
+    if (status == MAGNETIC_SENSOR_SPI_PARITY_ERROR) {
+      parity_error_count++;
+    } else if (status == MAGNETIC_SENSOR_SPI_SENSOR_ERROR) {
+      sensor_error_count++;
+    }
+  }
+
+  last_read_status = failed_status;
+  exhausted_retry_count++;
+
+  // Sensor::update() also retains its last valid angle for a negative result.
+  // Keeping the raw count here additionally protects direct getSensorAngle()
+  // callers and Sensor::init(), which performs direct reads.
+  return last_valid_count;
+}
+
+word MagneticSensorSPI::transferResponse(word command) {
+  // SPI - begin transaction
   spi->beginTransaction(settings);
 
-  //Send the command
+  // Send the command. AMS sensors return the requested register value in the
+  // following transfer, so the response received here belongs to an earlier
+  // command and is intentionally ignored.
   digitalWrite(chip_select_pin, LOW);
   spi->transfer16(command);
   digitalWrite(chip_select_pin,HIGH);
-  
+
 #if defined(ESP_H) && defined(ARDUINO_ARCH_ESP32) // if ESP32 board
   delayMicroseconds(50); // why do we need to delay 50us on ESP32? In my experience no extra delays are needed, on any of the architectures I've tested...
 #else
   delayMicroseconds(1); // delay 1us, the minimum time possible in plain arduino. 350ns is the required time for AMS sensors, 80ns for MA730, MA702
 #endif
 
-  //Now read the response
+  // Clock out the response to the command above. 0x0000 is a valid even-parity
+  // NOP frame for the supported AMS sensors.
   digitalWrite(chip_select_pin, LOW);
-  word register_value = spi->transfer16(0x00);
+  word register_value = spi->transfer16(0x0000);
   digitalWrite(chip_select_pin, HIGH);
 
-  //SPI - end transaction
   spi->endTransaction();
-
-  register_value = register_value >> (1 + data_start_bit - bit_resolution);  //this should shift data to the rightmost bits of the word
-
-  const static word data_mask = 0xFFFF >> (16 - bit_resolution);
-
-	return register_value & data_mask;  // Return the data, stripping the non data (e.g parity) bits
+  return register_value;
 }
 
 /**
@@ -178,5 +247,3 @@ word MagneticSensorSPI::read(word angle_register){
 void MagneticSensorSPI::close(){
 	spi->end();
 }
-
-
