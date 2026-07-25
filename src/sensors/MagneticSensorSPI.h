@@ -19,8 +19,9 @@ struct MagneticSensorSPIConfig_s  {
   int data_start_bit;
   int command_rw_bit;
   int command_parity_bit;
-  int response_parity_bit;
+  bool response_has_even_parity;
   int response_error_bit;
+  int response_error_clear_register;
 };
 // typical configuration structures
 extern MagneticSensorSPIConfig_s AS5147_SPI,AS5048_SPI,AS5047_SPI, MA730_SPI;
@@ -48,6 +49,8 @@ class MagneticSensorSPI: public Sensor{
     void init(SPIClass* _spi = &SPI);
 
     // implementation of abstract functions of the Sensor class
+    /** update tracking, safely seeding it after a delayed first valid read */
+    void update() override;
     /** get current angle (rad) */
     float getSensorAngle() override;
 
@@ -72,6 +75,11 @@ class MagneticSensorSPI: public Sensor{
     /** Invalid response-frame counters. */
     uint32_t parity_error_count = 0;
     uint32_t sensor_error_count = 0;
+    /** Automatic reads of the AMS ERRFL register and corrupt clear replies. */
+    uint32_t error_clear_count = 0;
+    uint32_t error_clear_parity_error_count = 0;
+    /** Lower data bits returned by the latest parity-valid ERRFL read. */
+    uint16_t last_error_flags = 0;
     /** Logical reads recovered by a retry. */
     uint32_t successful_retry_count = 0;
     /** Logical reads for which every attempt failed validation. */
@@ -102,6 +110,8 @@ class MagneticSensorSPI: public Sensor{
     int read(word angle_register);
     /** Execute one complete pipelined command/response transaction. */
     word transferResponse(word command);
+    /** Build a read command including its outgoing parity bit. */
+    word buildReadCommand(word register_address);
     /** Calculate parity value  */
     byte spiCalcEvenParity(word value);
 
@@ -115,9 +125,11 @@ class MagneticSensorSPI: public Sensor{
     int command_parity_bit; //!< the bit where parity flag is stored in command
     int command_rw_bit; //!< the bit where read/write flag is stored in command
     int data_start_bit; //!< the the position of first bit
-    int response_parity_bit; //!< optional response parity bit (zero disables)
+    bool response_has_even_parity; //!< validate even parity over all 16 bits
     int response_error_bit; //!< optional response error bit (zero disables)
+    int response_error_clear_register; //!< register read to clear latched error
     int last_valid_count = -1; //!< validated fallback used after exhausted retries
+    bool tracking_initialized = false; //!< base Sensor state has a valid seed
 
     SPIClass* spi;
 };
