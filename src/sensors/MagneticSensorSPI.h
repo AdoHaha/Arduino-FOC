@@ -7,6 +7,7 @@
 #include "../common/base_classes/Sensor.h"
 #include "../common/foc_utils.h"
 #include "../common/time_utils.h"
+#include "MagneticSensorSPIResponse.h"
 
 #define DEF_ANGLE_REGISTER 0x3FFF
 
@@ -18,6 +19,8 @@ struct MagneticSensorSPIConfig_s  {
   int data_start_bit;
   int command_rw_bit;
   int command_parity_bit;
+  int response_parity_bit;
+  int response_error_bit;
 };
 // typical configuration structures
 extern MagneticSensorSPIConfig_s AS5147_SPI,AS5048_SPI,AS5047_SPI, MA730_SPI;
@@ -45,6 +48,37 @@ class MagneticSensorSPI: public Sensor{
     /** get current angle (rad) */
     float getSensorAngle() override;
 
+    /**
+     * Number of complete command/response retries after an invalid response.
+     *
+     * Retrying the complete transaction is required by pipelined AMS sensors:
+     * a register response is returned during the transfer following its
+     * command. A value of zero disables retries but not validation.
+     */
+    uint8_t response_retries = 1;
+
+    /** Raw response word from the most recent transfer. */
+    uint16_t last_response = 0;
+    /**
+     * Status of the most recent logical read. A non-zero value after the read
+     * means all attempts failed and the last valid angle was retained.
+     */
+    MagneticSensorSPIReadStatus last_read_status =
+        MAGNETIC_SENSOR_SPI_READ_OK;
+
+    /** Invalid response-frame counters. */
+    uint32_t parity_error_count = 0;
+    uint32_t sensor_error_count = 0;
+    /** Logical reads recovered by a retry. */
+    uint32_t successful_retry_count = 0;
+    /** Logical reads for which every attempt failed validation. */
+    uint32_t exhausted_retry_count = 0;
+
+    /** True after at least one validated angle has been received. */
+    bool hasValidData() const;
+    /** Reset diagnostic counters without changing the retained angle. */
+    void clearErrorCounters();
+
     // returns the spi mode (phase/polarity of read/writes) i.e one of SPI_MODE0 | SPI_MODE1 | SPI_MODE2 | SPI_MODE3
     int spi_mode;
     
@@ -61,8 +95,10 @@ class MagneticSensorSPI: public Sensor{
     // spi functions
     /** Stop SPI communication */
     void close(); 
-    /** Read one SPI register value */
-    word read(word angle_register);
+    /** Read one SPI register value, returning -1 before the first valid read. */
+    int read(word angle_register);
+    /** Execute one complete pipelined command/response transaction. */
+    word transferResponse(word command);
     /** Calculate parity value  */
     byte spiCalcEvenParity(word value);
 
@@ -76,6 +112,9 @@ class MagneticSensorSPI: public Sensor{
     int command_parity_bit; //!< the bit where parity flag is stored in command
     int command_rw_bit; //!< the bit where read/write flag is stored in command
     int data_start_bit; //!< the the position of first bit
+    int response_parity_bit; //!< optional response parity bit (zero disables)
+    int response_error_bit; //!< optional response error bit (zero disables)
+    int last_valid_count = -1; //!< validated fallback used after exhausted retries
 
     SPIClass* spi;
 };
